@@ -4,7 +4,7 @@ use std::io::Read;
 use std::io::Write as IOWrite;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -26,6 +26,7 @@ pub struct Prometheus {
 impl Prometheus {
     pub fn new(cfg: PrometheusConfig) -> Result<Self> {
         let metrics = Arc::new(Mutex::new(Metrics::new(cfg.enums)));
+        let max_connections = cfg.max_connections.max(1);
 
         debug!("new: listening for connections on address {}", cfg.address);
         let listener = TcpListener::bind(&cfg.address)
@@ -35,7 +36,7 @@ impl Prometheus {
         let thread_handle = {
             let listener_clone = listener.try_clone().context("failed to clone socket")?;
             let metrics_clone = metrics.clone();
-            thread::spawn(move || tcp_handler(listener_clone, &metrics_clone))
+            thread::spawn(move || tcp_handler(listener_clone, &metrics_clone, max_connections))
         };
 
         Ok(Prometheus {
@@ -98,14 +99,26 @@ impl super::Plugin for Prometheus {
     }
 }
 
-fn tcp_handler(listener: TcpListener, metrics: &Arc<Mutex<Metrics>>) -> Result<()> {
+fn tcp_handler(
+    listener: TcpListener,
+    metrics: &Arc<Mutex<Metrics>>,
+    max_connections: usize,
+) -> Result<()> {
+    let connections = Semaphore::new(max_connections);
     for stream in listener.incoming() {
         let stream = stream.context("closed socket")?;
 
-        if let Err(e) = handle_connection(stream, metrics) {
-            // warn but continue processing
-            warn!("tcp_handler: could not handle connection: {}", e);
-        }
+        let guard = connections.borrow();
+        thread::spawn({
+            let metrics = metrics.clone();
+            move || {
+                let _guard = guard;
+                if let Err(e) = handle_connection(stream, &metrics) {
+                    // warn but continue processing
+                    warn!("tcp_handler: could not handle connection: {}", e);
+                }
+            }
+        });
     }
 
     Ok(())
@@ -471,15 +484,61 @@ fn type_counter<'a>(
     (k, m)
 }
 
+pub struct Semaphore(Arc<SemaphoreImpl>);
+
+pub struct SemaphoreImpl {
+    available: Mutex<usize>,
+    condvar: Condvar,
+}
+
+pub struct Permit(Arc<SemaphoreImpl>);
+
+impl Semaphore {
+    pub fn new(limit: usize) -> Self {
+        Semaphore(Arc::new(SemaphoreImpl {
+            available: Mutex::new(limit),
+            condvar: Condvar::new(),
+        }))
+    }
+
+    pub fn borrow(&self) -> Permit {
+        self.0.clone().borrow()
+    }
+}
+
+impl SemaphoreImpl {
+    fn borrow(self: Arc<Self>) -> Permit {
+        let mut guard = self.available.lock().unwrap();
+        while *guard == 0 {
+            guard = self.condvar.wait(guard).unwrap();
+        }
+        *guard -= 1;
+        Permit(self.clone())
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        *(self.0.available.lock().unwrap()) += 1;
+        self.0.condvar.notify_one();
+    }
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug, Clone, Default)]
 pub struct PrometheusConfig {
     #[serde(default = "default_address")]
     pub address: LocalAddress,
     #[serde(default)]
     pub enums: bool,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
     pub id: Option<String>, // ! deprecated !
 }
 
 fn default_address() -> LocalAddress {
     LocalAddress::Unspecified(9942)
+}
+
+fn default_max_connections() -> usize {
+    32
 }
