@@ -1,6 +1,6 @@
 [package]
 name = "drbd-reactor"
-version = "1.6.0-rc.1"
+version = "1.11.0"
 authors = ["Roland Kammerer <roland.kammerer@linbit.com>", "Moritz Wanzenböck <moritz.wanzenboeck@linbit.com>"]
 edition = "2018"
 description = "Reacts to DRBD events via plugins."
@@ -27,7 +27,6 @@ tinytemplate = "1"
 serde_json = "1"
 shell-words = "1"
 crossbeam-channel = ">= 0.4"
-atty = ">= 0.2"
 agentx = ">= 0.1"
 # drbd-reactorctl
 clap = "2" # jammy has 2, noble has 2 and 3

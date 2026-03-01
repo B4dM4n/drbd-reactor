@@ -8,6 +8,8 @@ use std::str::FromStr;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::utils;
+
 common_matchable![Vec<Connection>, Vec<Device>];
 make_matchable![
     #[derive(Default, Debug, Serialize, Clone, PartialEq, Deserialize)]
@@ -42,7 +44,7 @@ impl FromStr for BackingDevice {
 impl fmt::Display for BackingDevice {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.0 {
-            Some(bd) => write!(f, "{}", bd),
+            Some(bd) => write!(f, "{bd}"),
             None => write!(f, "none"),
         }
     }
@@ -1251,7 +1253,7 @@ pub fn get_drbd_versions() -> anyhow::Result<DRBDVersion> {
         .output()
     {
         Ok(x) => x,
-        Err(e) => return Err(anyhow::anyhow!("failed running drbdadm --version: {}", e)),
+        Err(e) => return Err(anyhow::anyhow!("failed running drbdadm --version: {e}")),
     };
 
     if !version.status.success() {
@@ -1277,8 +1279,7 @@ fn split_version(pattern: regex::Regex, stdout: Vec<u8>) -> anyhow::Result<Versi
         .lines()
         .find_map(|line| pattern.captures(line))
         .ok_or(anyhow::anyhow!(
-            "Could not determine version from pattern '{}'",
-            pattern
+            "Could not determine version from pattern '{pattern}'"
         ))?;
 
     let version = u32::from_str_radix(&version[1], 16)?;
@@ -1292,4 +1293,80 @@ fn split_version(pattern: regex::Regex, stdout: Vec<u8>) -> anyhow::Result<Versi
         minor,
         patch,
     })
+}
+
+#[derive(PartialEq)]
+pub enum PrimaryOn {
+    Local(String),
+    Remote(String),
+    None,
+}
+impl Serialize for PrimaryOn {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+impl PrimaryOn {
+    pub fn terminal(&self, _verbose: bool) -> anyhow::Result<String> {
+        Ok(match self {
+            Self::Local(_) => "this node".to_string(),
+            Self::Remote(p) => format!("node '{p}'"),
+            Self::None => "<unknown>".to_string(),
+        })
+    }
+}
+impl fmt::Display for PrimaryOn {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Local(l) => write!(f, "{l}"),
+            Self::Remote(r) => write!(f, "{r}"),
+            Self::None => write!(f, "unknown"),
+        }
+    }
+}
+
+pub fn get_primary(drbd_resource: &str) -> anyhow::Result<PrimaryOn> {
+    let output = Command::new("drbdsetup")
+        .arg("status")
+        .arg("--json")
+        .arg(drbd_resource)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "'drbdsetup status' not executed successfully"
+        ));
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Resource {
+        role: Role,
+        connections: Vec<Connection>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Connection {
+        name: String,
+        peer_role: Role,
+    }
+    let resources: Vec<Resource> = serde_json::from_slice(&output.stdout)?;
+    if resources.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "resources length from drbdsetup status not exactly 1"
+        ));
+    }
+
+    // is it me?
+    if resources[0].role == Role::Primary {
+        return Ok(PrimaryOn::Local(utils::uname_n()?));
+    }
+
+    // a peer?
+    for conn in &resources[0].connections {
+        if conn.peer_role == Role::Primary {
+            return Ok(PrimaryOn::Remote(conn.name.clone()));
+        }
+    }
+
+    Ok(PrimaryOn::None)
 }

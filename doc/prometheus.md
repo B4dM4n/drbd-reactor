@@ -8,7 +8,16 @@ The plugin is enabled by adding a `prometheus` section to drbd-reactor's configu
 ```
 [[prometheus]]
 enums = true
+address = ":9942"
 ```
+
+## Configuration
+
+- `enums` (boolean, default: `false`): If set to true, various metrics that are represented as strings
+  (e.g., resource state) are also exported as enumerated integer values. This allows
+  easier graphing and alerting on these metrics.
+- `address` (string, default: `":9942"`): The address and port to bind the Prometheus HTTP endpoint to.
+  The default port of `9942` is [registered with the Prometheus organization](https://github.com/prometheus/prometheus/wiki/Default-port-allocations). 
 
 ## Metrics
 
@@ -31,6 +40,8 @@ enums = true
 - `drbd_device_upperpending gauge`: Number of block I/O requests forwarded to DRBD, but not yet answered by DRBD.
 - `drbd_device_written_bytes_total counter`: Net data written on local disk
 - `drbd_peerdevice_outofsync_bytes gauge`: Number of bytes currently out of sync with this peer, according to the bitmap that DRBD has for it
+- `drbd_peerdevice_sent_bytes`: Number of bytes currently sent to this peer
+- `drbd_peerdevice_received_bytes`: Number of bytes currently received from this peer
 - `drbd_resource_maypromote gauge`: Boolean whether the resource may be promoted to Primary
 - `drbd_resource_promotionscore gauge`: The promotion score (higher is better) for the resource
 - `drbd_resource_resources gauge`: Number of resources
@@ -46,7 +57,7 @@ In this repository, we provide an [example dashboard](/example/grafana-dashboard
 that showcases some of the generic use cases that can be accomplished with
 these metrics.
 
-The json files can simply be imported into your Grafana instance.
+The dashboard is published in the Grafana dashboard registry: [DRBD Grafana Dashboard](https://grafana.com/grafana/dashboards/14339-drbd/)
 
 ---
 

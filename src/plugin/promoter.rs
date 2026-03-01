@@ -1,9 +1,8 @@
-use std::collections::{BTreeMap, HashSet};
-use std::ffi::CStr;
+use core::time;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::fs::File;
-use std::io;
 use std::io::Write;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -12,17 +11,20 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use libc::c_char;
-use log::{debug, info, trace, warn};
+use anyhow::{anyhow, Result};
+use log::{debug, error, info, trace, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tinytemplate::TinyTemplate;
 
-use crate::drbd::{DiskState, EventType, PluginUpdate, Resource, Role};
+use crate::drbd::{
+    get_primary, ConnectionState, DiskState, EventType, PluginUpdate, PrimaryOn, Resource, Role,
+};
+use crate::drbdstatus;
 use crate::plugin;
 use crate::plugin::PluginCfg;
 use crate::systemd;
+use crate::utils;
 
 pub struct Promoter {
     cfg: PromoterConfig,
@@ -30,22 +32,23 @@ pub struct Promoter {
 
 impl Promoter {
     pub fn new(cfg: PromoterConfig) -> Result<Self> {
-        let names = cfg.resources.keys().cloned().collect::<Vec<String>>();
-        trace!("Executing adjust_resources({:?})'", &names);
-        if let Err(e) = adjust_resources(&names) {
-            warn!("Could not adjust '{:?}': {}", names, e);
+        let to_adjust: Vec<_> = cfg
+            .resources
+            .iter()
+            .filter(|(_, cfg)| cfg.adjust_resource_on_start)
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        trace!("Executing adjust_resources({:?})'", &to_adjust);
+        if let Err(e) = adjust_resources(&to_adjust) {
+            warn!("Could not adjust '{to_adjust:?}': {e}");
         }
-        trace!("Executed adjust_resources({:?})'", &names);
+        trace!("Executed adjust_resources({:?})'", &to_adjust);
 
         for (name, res) in &cfg.resources {
             // deprecated settings
             if !res.on_stop_failure.is_empty() {
                 warn!("'on-stop-failure' is deprecated and ignored!; use 'on-drbd-demote-failure'");
-            }
-
-            info!("Checking DRBD options for resource '{}'", name);
-            if let Err(e) = check_resource(name, &res.on_quorum_loss) {
-                warn!("Could not execute DRBD options check: {}", e);
             }
 
             if res.runner == Runner::Systemd {
@@ -55,7 +58,7 @@ impl Promoter {
                     failure_action: res.on_drbd_demote_failure.clone(),
                 };
                 generate_systemd_templates(
-                    name,
+                    &name,
                     &res.start,
                     &systemd_settings,
                     res.secondary_force,
@@ -73,10 +76,7 @@ impl super::Plugin for Promoter {
     fn run(&self, rx: super::PluginReceiver) -> Result<()> {
         trace!("run: start");
 
-        let type_exists = plugin::typefilter(&EventType::Exists);
-        let type_change = plugin::typefilter(&EventType::Change);
         let names = self.cfg.resources.keys().cloned().collect::<Vec<String>>();
-        let names_filter = plugin::namefilter(&names);
 
         // set default stop actions (i.e., reversed start)
         let cfg = {
@@ -90,10 +90,44 @@ impl super::Plugin for Promoter {
             cfg
         };
 
-        let ticker = crossbeam_channel::tick(Duration::from_secs(MIN_SECS_PROMOTE));
+        // the target might be in a half started state, for example after a "disable" failed to
+        // demote.
+        // Then on start we might never get a may_promote:yes and we never start the services on
+        // top of the promoted Primary.
+        // inserting the names into may_promote HashSet is tempting, but the first update might delete
+        // them before the first ticker, so just start them as usual and be done
+        for name in &names {
+            if !try_initial_target_start(name) {
+                continue;
+            }
+            if let Some(res) = cfg.resources.get(name) {
+                // startup is usually always racy, but pretend nodes started at the same time and
+                // calculate a position in the preferred nodes. We also try to avoid starting on a
+                // Diskless node.
+                let mut sleep_s = 0;
+                let sleep_disk_s = match get_backing_devices(&name) {
+                    Ok(devices) if devices.contains(&"none".into()) => 6, // Diskless
+                    _ => 0,
+                };
+                debug!("initial sleep disk state: '{sleep_disk_s}'");
+                sleep_s += sleep_disk_s;
+                let sleep_pref_nodes_s = get_preferred_nodes_sleep_s(&res.preferred_nodes);
+                debug!("initial sleep preferred-nodes: '{sleep_pref_nodes_s}'");
+                sleep_s += sleep_pref_nodes_s;
+                thread::sleep(time::Duration::from_secs(sleep_s));
 
+                try_start_stop_actions(name, &res.start, &res.stop, &res.runner);
+            }
+        }
+
+        let names_filter = plugin::namefilter(&names);
+        let type_exists = plugin::typefilter(&EventType::Exists);
+        let type_change = plugin::typefilter(&EventType::Change);
+
+        let ticker = crossbeam_channel::tick(Duration::from_secs(MIN_SECS_PROMOTE));
         let mut last_start = Instant::now() - Duration::from_secs(MIN_SECS_PROMOTE + 1);
         let mut may_promote: HashSet<String> = HashSet::new();
+        let mut sb_avoidance: HashMap<String, SplitBrainAvoidancePolicy> = HashMap::new();
 
         loop {
             crossbeam_channel::select! {
@@ -108,18 +142,21 @@ impl super::Plugin for Promoter {
                             last_start = Instant::now();
                             // see start_actions comments in process_drbd_event()
                             // we do not manipulate the may_promote state from here
-                            if start_actions(name, &res.start, &res.runner).is_err() {
-                                if let Err(e) = stop_actions(name, &res.stop, &res.runner) {
-                                    warn!("Stopping '{}' failed: {}", name, e);
-                                }
-                            }
+                            try_start_stop_actions(name, &res.start, &res.stop, &res.runner);
                         }
                     }
                 },
                 recv(rx) -> msg => match msg {
                     Ok(update) => {
                         if (type_change(&update) || type_exists(&update)) && names_filter(&update) {
-                            process_drbd_event(&update, &cfg, &mut last_start, &mut may_promote);
+                            let name = update.get_name();
+                            match get_split_brain_avoidance_policy(&name, &mut sb_avoidance, &cfg) {
+                                Ok(policy) => process_drbd_event(&update, &cfg, &mut last_start, &mut may_promote, &policy),
+                                Err(e) => {
+                                    error!("IGNORING resource '{name}': {e}");
+                                    continue;
+                                }
+                            };
                         }
                     },
                     Err(_) => break,
@@ -131,12 +168,14 @@ impl super::Plugin for Promoter {
         for (name, res) in cfg.resources {
             if res.stop_services_on_exit {
                 let shutdown = || -> Result<()> {
-                    fs::remove_file(escaped_services_target_dir(&name).join(SYSTEMD_BEFORE_CONF))?;
+                    fs::remove_file(
+                        systemd::escaped_services_target_dir(&name).join(SYSTEMD_BEFORE_CONF),
+                    )?;
                     systemd::daemon_reload()?;
                     stop_actions(&name, &res.stop, &res.runner)
                 };
                 if let Err(e) = shutdown() {
-                    warn!("Stopping '{}' failed: {}", name, e);
+                    warn!("Stopping '{name}' failed: {e}");
                 }
             }
         }
@@ -180,10 +219,18 @@ pub struct PromoterOptResource {
     pub sleep_before_promote_factor: u32,
     #[serde(default)]
     pub preferred_nodes: Vec<String>,
+    #[serde(default)]
+    pub preferred_nodes_policy: PreferredNodesPolicy,
     #[serde(default = "default_secondary_force")]
     pub secondary_force: bool,
     #[serde(default)]
     pub on_quorum_loss: QuorumLossPolicy,
+    #[serde(default)]
+    pub on_disk_detach: DiskDetachPolicy,
+    #[serde(default = "default_fence_delay")]
+    pub fencing_promote_delay: u64,
+    #[serde(default = "default_adjust_resource_on_start")]
+    pub adjust_resource_on_start: bool,
 }
 
 fn default_promote_sleep() -> u32 {
@@ -192,9 +239,16 @@ fn default_promote_sleep() -> u32 {
 fn default_secondary_force() -> bool {
     true
 }
+fn default_fence_delay() -> u64 {
+    5
+}
+
+fn default_adjust_resource_on_start() -> bool {
+    true
+}
 
 fn systemd_stop(unit: &str) -> Result<()> {
-    info!("systemd_stop: systemctl stop {}", unit);
+    info!("systemd_stop: systemctl stop {unit}");
     plugin::map_status(
         Command::new("systemctl")
             .stdin(Stdio::null())
@@ -209,6 +263,7 @@ fn process_drbd_event(
     cfg: &PromoterConfig,
     last_start: &mut Instant,
     may_promote: &mut HashSet<String>,
+    split_brain_avoidance_policy: &SplitBrainAvoidancePolicy,
 ) {
     let name = r.get_name();
     let res = cfg
@@ -226,29 +281,22 @@ fn process_drbd_event(
                 let sleep_millis = get_sleep_before_promote_ms(
                     &u.resource,
                     &res.preferred_nodes,
+                    split_brain_avoidance_policy,
                     &res.on_quorum_loss,
+                    res.fencing_promote_delay,
                     res.sleep_before_promote_factor,
                 );
 
-                // no saturating_sub on old rust
                 let min_sleep = Duration::from_secs(MIN_SECS_PROMOTE);
                 let calc_sleep = Duration::from_millis(sleep_millis);
-                let final_sleep = if calc_sleep >= min_sleep {
-                    Duration::from_secs(0)
-                } else {
-                    min_sleep - calc_sleep
-                };
 
-                if last_start.elapsed() < final_sleep {
-                    debug!("got may_promote but start interval for '{}' too fast", name);
+                if last_start.elapsed() + calc_sleep < min_sleep {
+                    debug!("got may_promote but start interval for '{name}' too fast");
                     return;
                 }
 
-                info!(
-                    "run: resource '{}' may promote after {}ms",
-                    name, sleep_millis
-                );
-                if sleep_millis > 0 {
+                info!("run: resource '{name}' may promote after {sleep_millis}ms");
+                if !calc_sleep.is_zero() {
                     thread::sleep(calc_sleep);
                 }
 
@@ -257,13 +305,10 @@ fn process_drbd_event(
                 // - start_actions is inherently racy
                 // - it really does not improve things a lot
                 // - better have only one source here that reflects events2 and only events2 at the time
-                if start_actions(&name, &res.start, &res.runner).is_err() {
-                    if let Err(e) = stop_actions(&name, &res.stop, &res.runner) {
-                        warn!("Stopping '{}' failed: {}", name, e);
-                    }
-                }
+                try_start_stop_actions(&name, &res.start, &res.stop, &res.runner);
             } else if u.old.role == Role::Primary
                 && u.new.role == Role::Secondary
+                && split_brain_avoidance_policy == &SplitBrainAvoidancePolicy::Quorum
                 && res.on_quorum_loss == QuorumLossPolicy::Freeze
             {
                 // might have been frozen, the other nodes formed a partition and a Primary
@@ -272,27 +317,28 @@ fn process_drbd_event(
                 //
                 // we could send a stop in any case, but that would also send stops (which should not matter)
                 // in case of a normal stop when quorum was lost but the policy was Shutdown
-                info!(
-                    "resource '{}' got forced to Secondary while frozen, stopping services",
-                    name
-                );
+                info!("resource '{name}' got forced to Secondary while frozen, stopping services");
                 if let Err(e) = stop_actions(&name, &res.stop, &res.runner) {
-                    warn!("Stopping '{}' failed: {}", name, e);
+                    warn!("Stopping '{name}' failed: {e}");
                 }
             }
         }
         PluginUpdate::Device(u) => {
+            if split_brain_avoidance_policy == &SplitBrainAvoidancePolicy::Fencing {
+                return;
+            }
+
             if u.old.quorum && !u.new.quorum {
-                info!("run: resource '{}' lost quorum", name);
+                info!("run: resource '{name}' lost quorum");
                 match res.on_quorum_loss {
                     QuorumLossPolicy::Freeze => {
                         if let Err(e) = freeze_actions(&name, State::Freeze, &res.runner) {
-                            warn!("Freezing '{}' failed: {}", name, e);
+                            warn!("Freezing '{name}' failed: {e}");
                         }
                     }
                     QuorumLossPolicy::Shutdown => {
                         if let Err(e) = stop_actions(&name, &res.stop, &res.runner) {
-                            warn!("Stopping '{}' failed: {}", name, e);
+                            warn!("Stopping '{name}' failed: {e}");
                         }
                     }
                 }
@@ -301,15 +347,51 @@ fn process_drbd_event(
                 && res.on_quorum_loss == QuorumLossPolicy::Freeze
                 && u.resource.role == Role::Primary
             {
-                info!("resource '{}' gained quorum, thawing Primary", name);
+                info!("resource '{name}' gained quorum, thawing Primary");
                 if let Err(e) = freeze_actions(&name, State::Thaw, &res.runner) {
-                    warn!("Thawing '{}' failed: {}", name, e);
+                    warn!("Thawing '{name}' failed: {e}");
                 }
+            } else if u.old.disk_state != DiskState::Diskless
+                && u.new.disk_state == DiskState::Diskless
+                && !u.old.client
+                && !u.new.client
+                && u.resource.role == Role::Primary
+            {
+                info!("resource '{name}' lost local disk");
+                if res.on_disk_detach == DiskDetachPolicy::Ignore {
+                    info!(
+                        "resource '{name}' on-disk-detach policy is '{}', not taking action",
+                        res.on_disk_detach
+                    );
+                    return;
+                }
+                info!(
+                    "resource '{name}' on-disk-detach policy is '{}', checking for UpToDate peer",
+                    res.on_disk_detach
+                );
+                for pd in u
+                    .resource
+                    .connections
+                    .iter()
+                    .flat_map(|c| c.peerdevices.iter())
+                {
+                    // check if we find an UpToDate peer
+                    if pd.peer_client == false && pd.peer_disk_state == DiskState::UpToDate {
+                        info!("resource '{name}' lost local disk, found UpToDate peer");
+                        if let Err(e) = stop_actions(&name, &res.stop, &res.runner) {
+                            warn!("Stopping '{name}' failed: {e}");
+                        }
+                        return;
+                    }
+                }
+                info!("resource '{name}' lost local disk, did not find UpToDate peer");
             }
         }
         PluginUpdate::PeerDevice(u) => {
             #[allow(clippy::if_same_then_else)]
             if res.preferred_nodes.is_empty() {
+                return;
+            } else if res.preferred_nodes_policy == PreferredNodesPolicy::StartOnly {
                 return;
             } else if !(u.old.peer_disk_state != DiskState::UpToDate
                 && u.new.peer_disk_state == DiskState::UpToDate)
@@ -322,7 +404,7 @@ fn process_drbd_event(
             let peer_name = match u.resource.get_peerdevice(u.peer_node_id, u.volume) {
                 Some(pd) => pd.conn_name.clone(),
                 None => {
-                    warn!("Could not find peer device for resource '{}'", name);
+                    warn!("Could not find peer device for resource '{name}'");
                     return;
                 }
             };
@@ -330,18 +412,15 @@ fn process_drbd_event(
                 Some(pos) => pos,
                 None => {
                     // not in the list, it can not be better
-                    debug!(
-                        "Peer '{}' was not found in preferred_nodes, continue",
-                        peer_name
-                    );
+                    debug!("Peer '{peer_name}' was not found in preferred_nodes, continue");
                     return;
                 }
             };
 
-            let node_name = match uname_n() {
+            let node_name = match utils::uname_n() {
                 Ok(node_name) => node_name,
                 Err(e) => {
-                    warn!("Could not determine 'uname -n': {}", e);
+                    warn!("Could not determine 'uname -n': {e}");
                     return;
                 }
             };
@@ -351,9 +430,9 @@ fn process_drbd_event(
             };
 
             if peer_pos < node_pos {
-                info!("run: resource '{}' has a new preferred node ('{}'), stopping services locally ('{}')", name, peer_name, node_name);
+                info!("run: resource '{name}' has a new preferred node ('{peer_name}'), stopping services locally ('{node_name}')");
                 if let Err(e) = stop_actions(&name, &res.stop, &res.runner) {
-                    warn!("Stopping '{}' failed: {}", name, e);
+                    warn!("Stopping '{name}' failed: {e}");
                 }
             }
         }
@@ -374,7 +453,7 @@ fn systemd_start(unit: &str) -> Result<()> {
         .arg(unit)
         .status();
 
-    info!("systemd_start: systemctl start {}", unit);
+    info!("systemd_start: systemctl start {unit}");
     plugin::map_status(
         Command::new("systemctl")
             .stdin(Stdio::null())
@@ -386,8 +465,7 @@ fn systemd_start(unit: &str) -> Result<()> {
     // still, we might catch it already here, otherwise we will check for the actual state in the "ticker"
     if !systemd::is_active(unit)? {
         return Err(anyhow::anyhow!(
-            "systemd_start: unit '{}' is not active",
-            unit
+            "systemd_start: unit '{unit}' is not active"
         ));
     }
 
@@ -407,8 +485,7 @@ fn systemd_freeze_thaw(unit: &str, to: State) -> Result<()> {
         }
     };
     info!(
-        "systemd_freeze_thaw: systemctl {} {}",
-        action,
+        "systemd_freeze_thaw: systemctl {action} {}",
         services.join(" ")
     );
 
@@ -420,7 +497,7 @@ fn systemd_freeze_thaw(unit: &str, to: State) -> Result<()> {
                 .arg(service_name.clone())
                 .status(),
         ) {
-            warn!("systemd_freeze_thaw: 'systemctl {} {}' failed ('{}'), this might be fine if there is no process in that unit", action, service_name, e);
+            warn!("systemd_freeze_thaw: 'systemctl {action} {service_name}' failed ('{e}'), this might be fine if there is no process in that unit");
         }
     }
 
@@ -446,6 +523,15 @@ fn action(what: &str, to: State, how: &Runner) -> Result<()> {
     }
 }
 
+fn try_start_stop_actions(name: &str, start: &[String], stop: &[String], how: &Runner) {
+    if let Err(e) = start_actions(name, start, how) {
+        warn!("Starting '{name}' failed: {e}");
+        if let Err(e) = stop_actions(name, stop, how) {
+            warn!("Stopping '{name}' failed: {e}");
+        }
+    }
+}
+
 fn start_actions(name: &str, actions: &[String], how: &Runner) -> Result<()> {
     match how {
         Runner::Shell => {
@@ -459,10 +545,7 @@ fn start_actions(name: &str, actions: &[String], how: &Runner) -> Result<()> {
 }
 
 fn stop_actions(name: &str, actions: &[String], how: &Runner) -> Result<()> {
-    info!(
-        "stop_actions (could trigger failure actions (e.g., reboot)): {}",
-        name
-    );
+    info!("stop_actions (could trigger 'on-drbd-demote-failure' actions if configured): {name}");
 
     match how {
         Runner::Shell => {
@@ -473,7 +556,7 @@ fn stop_actions(name: &str, actions: &[String], how: &Runner) -> Result<()> {
         }
         Runner::Systemd => {
             let target = systemd::escaped_services_target(name);
-            info!("stop_actions: stopping '{}'", target);
+            info!("stop_actions: stopping '{target}'");
             persist_journal();
             action(&target, State::Stop, how)
         }
@@ -487,10 +570,7 @@ fn freeze_actions(name: &str, to: State, how: &Runner) -> Result<()> {
         )),
         Runner::Systemd => {
             let target = systemd::escaped_services_target(name);
-            info!(
-                "freeze_actions: freezing/thawing services in target '{}'",
-                target
-            );
+            info!("freeze_actions: freezing/thawing services in target '{target}'");
             action(&target, to, how)
         }
     }
@@ -504,8 +584,7 @@ fn get_backing_devices(resname: &str) -> Result<Vec<String>> {
         .output()?;
     if !shlldev.status.success() {
         return Err(anyhow::anyhow!(
-            "'drbdadm sh-ll-dev {}' not executed successfully, stdout: '{}', stderr: '{}'",
-            resname,
+            "'drbdadm sh-ll-dev {resname}' not executed successfully, stdout: '{}', stderr: '{}'",
             String::from_utf8(shlldev.stdout).unwrap_or("<Could not convert stdout>".to_string()),
             String::from_utf8(shlldev.stderr).unwrap_or("<Could not convert stderr>".to_string())
         ));
@@ -526,8 +605,7 @@ fn get_target_services(target: &str) -> Result<Vec<String>> {
         .output()?;
     if !deps.status.success() {
         return Err(anyhow::anyhow!(
-            "'systemctl list-dependencies --no-pager --plain {}' not executed successfully, stdout: '{}', stderr: '{}'",
-            target,
+            "'systemctl list-dependencies --no-pager --plain {target}' not executed successfully, stdout: '{}', stderr: '{}'",
             String::from_utf8(deps.stdout).unwrap_or("<Could not convert stdout>".to_string()),
             String::from_utf8(deps.stderr).unwrap_or("<Could not convert stderr>".to_string())
         ));
@@ -546,14 +624,11 @@ fn get_target_services(target: &str) -> Result<Vec<String>> {
 fn adjust_resources(to_start: &[String]) -> Result<()> {
     for res in to_start {
         for dev in get_backing_devices(res)? {
-            info!(
-                "adjust_resources: waiting for backing device '{}' to become ready",
-                dev
-            );
+            info!("adjust_resources: waiting for backing device '{dev}' to become ready");
             while !drbd_backing_device_ready(&dev) {
                 thread::sleep(Duration::from_secs(2));
             }
-            info!("adjust_resources: backing device '{}' now ready", dev);
+            info!("adjust_resources: backing device '{dev}' now ready");
         }
 
         plugin::map_status(
@@ -575,8 +650,7 @@ fn drbd_backing_device_ready(dev: &str) -> bool {
         }
 }
 
-const SYSTEMD_PREFIX: &str = "/run/systemd/system";
-const SYSTEMD_CONF: &str = "reactor.conf";
+pub const SYSTEMD_CONF: &str = "reactor.conf";
 const SYSTEMD_BEFORE_CONF: &str = "reactor-50-before.conf";
 pub const OCF_PATTERN: &str = r"^ocf:(\S+):(\S+)\s+((?s).*)$";
 
@@ -589,16 +663,14 @@ fn generate_systemd_templates(
     let escaped_name = systemd::escape_name(name);
 
     if let Some(content) = drbd_promote(systemd_settings, secondary_force)? {
-        let prefix =
-            Path::new(SYSTEMD_PREFIX).join(format!("drbd-promote@{}.service.d", escaped_name));
+        let prefix = Path::new(systemd::SYSTEMD_RUN_PREFIX)
+            .join(format!("drbd-promote@{escaped_name}.service.d"));
         systemd_write_unit(prefix, SYSTEMD_CONF, content)?;
     }
 
     if systemd_settings.failure_action != SystemdFailureAction::None {
-        let prefix = Path::new(SYSTEMD_PREFIX).join(format!(
-            "drbd-demote-or-escalate@{}.service.d",
-            escaped_name
-        ));
+        let prefix = Path::new(systemd::SYSTEMD_RUN_PREFIX)
+            .join(format!("drbd-demote-or-escalate@{escaped_name}.service.d"));
         let mut content = format!(
             "[Unit]\nFailureAction={}\nConflicts=drbd-promote@%i.service\n",
             systemd_settings.failure_action
@@ -616,11 +688,8 @@ fn generate_systemd_templates(
     for action in actions {
         let action = action.trim();
         let deps = match target_requires.last() {
-            Some(prev) => vec![
-                format!("drbd-promote@{}.service", escaped_name),
-                prev.to_string(),
-            ],
-            None => vec![format!("drbd-promote@{}.service", escaped_name)],
+            Some(prev) => vec![prev.to_string()],
+            None => Vec::new(),
         };
 
         let (service_name, env) = match ocf_pattern.captures(action) {
@@ -635,15 +704,13 @@ fn generate_systemd_templates(
         // likely this might happen when people think that they can use something like "/mnt/data"
         // for their mount units (which is allowed in systemctl start). we don't allow that, people
         // have to use proper names.
-        if service_name.contains("/") {
+        if service_name.contains('/') {
             return Err(anyhow::anyhow!(
-                "generate_systemd_templates: Service name '{}' contains a '/'; If this is a mount unit please use \"systemd-escape --path --suffix=mount '{}'\"",
-                service_name,
-                service_name
+                "generate_systemd_templates: Service name '{service_name}' contains a '/'; If this is a mount unit please use \"systemd-escape --path --suffix=mount '{service_name}'\""
             ));
         }
 
-        let prefix = Path::new(SYSTEMD_PREFIX).join(format!("{}.d", service_name));
+        let prefix = Path::new(systemd::SYSTEMD_RUN_PREFIX).join(format!("{service_name}.d"));
         if service_name.ends_with(".mount") {
             systemd_write_unit(
                 prefix.clone(),
@@ -654,7 +721,7 @@ fn generate_systemd_templates(
         systemd_write_unit(
             prefix,
             SYSTEMD_CONF,
-            systemd_unit(&escaped_name, &deps, systemd_settings, &env)?,
+            promote_unit(&escaped_name, &deps, systemd_settings, &env)?,
         )?;
 
         // we would not need to keep the order here, as it does not matter
@@ -663,8 +730,7 @@ fn generate_systemd_templates(
         // and we use .last() below
         if target_requires.contains(&service_name) {
             return Err(anyhow::anyhow!(
-                "generate_systemd_templates: Service name '{}' already used",
-                service_name
+                "generate_systemd_templates: Service name '{service_name}' already used"
             ));
         }
         target_requires.push(service_name.clone());
@@ -680,10 +746,14 @@ fn generate_systemd_templates(
 
     // target and the extra Before= override
     if let Some(content) = systemd_target_requires(&target_requires, systemd_settings)? {
-        systemd_write_unit(escaped_services_target_dir(name), SYSTEMD_CONF, content)?;
+        systemd_write_unit(
+            systemd::escaped_services_target_dir(name),
+            SYSTEMD_CONF,
+            content,
+        )?;
     }
     systemd_write_unit(
-        escaped_services_target_dir(name),
+        systemd::escaped_services_target_dir(name),
         SYSTEMD_BEFORE_CONF,
         "[Unit]\nBefore=drbd-reactor.service\n".to_string(),
     )
@@ -727,7 +797,7 @@ OnFailureJobMode=replace-irreversibly
 }
 
 // does not do further escaping, caller needs to do it
-fn systemd_unit(
+fn promote_unit(
     name: &str,
     deps: &[String],
     systemd_settings: &SystemdSettings,
@@ -735,7 +805,10 @@ fn systemd_unit(
 ) -> Result<String> {
     const UNIT_TEMPLATE: &str = r"[Unit]
 Description=drbd-reactor controlled %N
-PartOf = drbd-services@{name}.target
+PartOf = drbd-services@{name | unescaped}.target
+
+BindsTo = drbd-promote@{name | unescaped}.service
+After = drbd-promote@{name | unescaped}.service
 {{ for dep in deps }}
 {strictness} = {dep | unescaped}
 After = {dep}
@@ -802,11 +875,11 @@ fn systemd_target_requires(
 }
 
 fn systemd_write_unit(prefix: PathBuf, unit: &str, content: String) -> Result<()> {
-    let content = format!("# Auto-generated by drbd-reactor, DO NOT EDIT\n{}", content);
+    let content = format!("# Auto-generated by drbd-reactor, DO NOT EDIT\n{content}");
 
     let path = prefix.join(unit);
-    let tmp_path = prefix.join(format!("{}.tmp", unit));
-    info!("systemd_write_unit: creating {:?}", path);
+    let tmp_path = prefix.join(format!("{unit}.tmp"));
+    info!("systemd_write_unit: creating {path:?}");
 
     fs::create_dir_all(&prefix)?;
     {
@@ -901,6 +974,51 @@ impl Default for QuorumLossPolicy {
         Self::Shutdown
     }
 }
+impl fmt::Display for QuorumLossPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Shutdown => write!(f, "shutdown"),
+            Self::Freeze => write!(f, "freeze"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Hash, Debug, PartialEq, Eq, Clone)]
+pub enum DiskDetachPolicy {
+    #[serde(rename = "ignore")]
+    Ignore,
+    #[serde(rename = "fail-over")]
+    FailOver,
+}
+impl Default for DiskDetachPolicy {
+    fn default() -> Self {
+        Self::Ignore
+    }
+}
+impl fmt::Display for DiskDetachPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Ignore => write!(f, "ignore"),
+            Self::FailOver => write!(f, "fail-over"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Hash, Debug, PartialEq, Eq, Clone)]
+pub enum SplitBrainAvoidancePolicy {
+    #[serde(rename = "quorum")]
+    Quorum,
+    #[serde(rename = "fencing")]
+    Fencing,
+}
+impl fmt::Display for SplitBrainAvoidancePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Quorum => write!(f, "quorum"),
+            Self::Fencing => write!(f, "fencing"),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Eq, Hash, Debug, PartialEq, Clone)]
 pub enum Runner {
@@ -915,13 +1033,28 @@ impl Default for Runner {
     }
 }
 
+#[derive(Serialize, Deserialize, Hash, Debug, PartialEq, Eq, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreferredNodesPolicy {
+    Always,
+    StartOnly,
+}
+impl Default for PreferredNodesPolicy {
+    fn default() -> Self {
+        Self::Always
+    }
+}
+
 fn get_sleep_before_promote_ms(
     resource: &Resource,
     preferred_nodes: &[String],
+    split_brain_avoidance_policy: &SplitBrainAvoidancePolicy,
     on_quorum_loss: &QuorumLossPolicy,
+    fencing_promote_delay_s: u64,
     factor: u32,
 ) -> u64 {
-    let mut max_sleep_s: u64 = resource
+    let mut sleep_s = 0;
+    let sleep_disk_s = resource
         .devices
         .iter()
         .map(|d| match d.disk_state {
@@ -941,170 +1074,195 @@ fn get_sleep_before_promote_ms(
             Ok(devices) if devices.contains(&"none".into()) => 6, // Diskless
             _ => 0,
         });
+    debug!("sleep disk state ({split_brain_avoidance_policy}): '{sleep_disk_s}'");
+    sleep_s += sleep_disk_s;
 
-    match uname_n() {
-        Ok(node_name) => {
-            max_sleep_s += match preferred_nodes.iter().position(|n| n == &node_name) {
-                Some(pos) => pos as u64,
-                None => preferred_nodes.len() as u64,
-            };
+    let sleep_pref_nodes = get_preferred_nodes_sleep_s(preferred_nodes);
+    debug!("sleep preferred-nodes ({split_brain_avoidance_policy}): '{sleep_pref_nodes}'");
+    sleep_s += sleep_pref_nodes;
+
+    #[allow(clippy::collapsible_if)]
+    if split_brain_avoidance_policy == &SplitBrainAvoidancePolicy::Fencing {
+        // when the system is up an running, we can expect current connection state,
+        // but during the very initial startup we get an "exists resource may_promote:yes"
+        // as the first message. at that time we don't have current connection state
+        // if we unwrap there, we assume it was the initial up and don't sleep
+        let sleep_fencing_s = resource
+            .connections
+            .iter()
+            .map(|c| match c.connection {
+                ConnectionState::Connected => 0,
+                _ => fencing_promote_delay_s,
+            })
+            .max()
+            .unwrap_or(0);
+        debug!("sleep connection state ({split_brain_avoidance_policy}): '{sleep_fencing_s}'");
+        sleep_s += sleep_fencing_s;
+    } else if split_brain_avoidance_policy == &SplitBrainAvoidancePolicy::Quorum {
+        if *on_quorum_loss == QuorumLossPolicy::Freeze && resource.role == Role::Secondary {
+            // nodes might have lost their replication network, and now they join in a random order
+            // some random Secondaries might have gained quorum, but we still have a frozen Primary
+            // we don't want to start the service immediately on one of those Secondaries, give the Primary an advantage
+            // the Secondaries might joint it, and it might thaw, and then
+            // promotion on these Secondaries fails intentionally
+            let sleep_freeze = 2;
+            debug!("sleep freeze-policy ({on_quorum_loss}): '{sleep_freeze}'");
+            sleep_s += sleep_freeze;
         }
-        Err(e) => warn!("Could not determine 'uname -n': {}", e),
-    };
-
-    if *on_quorum_loss == QuorumLossPolicy::Freeze && resource.role == Role::Secondary {
-        // nodes might have lost their replication network, and now they join in a random order
-        // some random Secondaries might have gained quorum, but we still have a frozen Primary
-        // we don't want to start the service immediately on one of those Secondaries, give the Primary an advantage
-        // the Secondaries might joint it, and it might thaw, and then
-        // promotion on these Secondaries fails intentionally
-        max_sleep_s += 2;
     }
 
     // convert to ms and scale by factor
-    max_sleep_s * 1000 * (factor as u64)
+    sleep_s * 1000 * (factor as u64)
 }
 
-fn escaped_services_target_dir(name: &str) -> PathBuf {
-    Path::new(SYSTEMD_PREFIX).join(format!("{}.d", systemd::escaped_services_target(name)))
+fn get_split_brain_avoidance_policy(
+    resname: &str,
+    sb_avoidance: &mut HashMap<String, SplitBrainAvoidancePolicy>,
+    cfg: &PromoterConfig,
+) -> Result<SplitBrainAvoidancePolicy> {
+    let quorum_off = "off";
+    let fencing_off = "dont-care";
+
+    // do we have it cached?
+    if let Some(policy) = sb_avoidance.get(resname) {
+        return Ok(policy.clone());
+    };
+
+    // detect it
+    let res = drbdstatus::get(resname)?;
+    let split_brain_avoidance_policy = if res.options.quorum == quorum_off {
+        for conn in &res.connections {
+            if conn.net.fencing == fencing_off {
+                return Err(anyhow!(
+                    "quorum is '{quorum_off}', but also fencing is '{fencing_off}'"
+                ));
+            }
+        }
+        SplitBrainAvoidancePolicy::Fencing
+    } else {
+        SplitBrainAvoidancePolicy::Quorum
+    };
+    sb_avoidance.insert(resname.into(), split_brain_avoidance_policy.clone());
+    info!("Detected split-brain avoidance policy: '{split_brain_avoidance_policy}'");
+
+    // we detected the sb avoidance policy for the first time, also check the rest of the
+    // resource
+    let on_quorum_loss = &cfg
+        .resources
+        .get(resname)
+        .expect("resource name is valid")
+        .on_quorum_loss;
+
+    if let Err(e) = check_resource(&res, on_quorum_loss, &split_brain_avoidance_policy) {
+        warn!("Could not execute DRBD options check: {e}");
+    }
+
+    Ok(split_brain_avoidance_policy)
 }
 
-fn check_resource(name: &str, on_quorum_loss: &QuorumLossPolicy) -> Result<()> {
-    #[derive(Serialize, Deserialize)]
-    struct Resource {
-        resource: String,
-        options: Options,
-        connections: Vec<Connection>,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    struct Options {
-        auto_promote: bool,
-        quorum: String,
-        on_no_quorum: String,
-        on_suspended_primary_outdated: String,
-        on_no_data_accessible: String,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    struct Connection {
-        // even if we expect the net options to be set globally, they are
-        // "inherited" downwards to the individual connections
-        net: Net,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    struct Net {
-        rr_conflict: String,
-    }
-
-    let check_for = |res: &str, what: &str, expected: &str, is: &str| {
+fn check_resource(
+    res: &drbdstatus::Resource,
+    on_quorum_loss: &QuorumLossPolicy,
+    split_brain_avoidance_policy: &SplitBrainAvoidancePolicy,
+) -> Result<()> {
+    let check_is = |what: &str, expected: &str, is: &str| {
         if expected != is {
             warn!(
                 "resource '{}': DRBD option '{}' should be '{}', but is '{}'",
-                res, what, expected, is
+                res.resource, what, expected, is
             );
         }
     };
 
-    let output = Command::new("drbdsetup")
-        .stdin(Stdio::null())
-        .arg("show")
-        .arg("--show-defaults")
-        .arg("--json")
-        .arg(name)
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "'drbdsetup show' not executed successfully"
-        ));
-    }
+    let check_not = |what: &str, not: &str, is: &str| {
+        if not == is {
+            warn!(
+                "resource '{}': DRBD option '{}' should be not be '{}'",
+                res.resource, what, not
+            );
+        }
+    };
 
-    let stdout = String::from_utf8(output.stdout)?;
-    let resources: Vec<Resource> = serde_json::from_str(&stdout)?;
-    if resources.len() != 1 {
-        return Err(anyhow::anyhow!(
-            "resources length from drbdsetup show not exactly 1"
-        ));
-    }
-    if resources[0].resource != name {
-        return Err(anyhow::anyhow!(
-            "res name to check ('{}') and drbdsetup show output ('{}') did not match",
-            name,
-            resources[0].resource
-        ));
-    }
-
-    check_for(
-        name,
+    check_is(
         "auto-promote",
         "no",
-        match resources[0].options.auto_promote {
+        match res.options.auto_promote {
             true => "yes",
             false => "no",
         },
     );
-    check_for(name, "quorum", "majority", &resources[0].options.quorum);
-    check_for(
-        name,
+    match split_brain_avoidance_policy {
+        SplitBrainAvoidancePolicy::Quorum => check_is("quorum", "majority", &res.options.quorum),
+        SplitBrainAvoidancePolicy::Fencing => check_is("quorum", "off", &res.options.quorum),
+    };
+    check_is(
         "on-suspended-primary-outdated",
         "force-secondary",
-        &resources[0].options.on_suspended_primary_outdated,
+        &res.options.on_suspended_primary_outdated,
     );
 
-    let on_no_quorum_policy = match on_quorum_loss {
-        QuorumLossPolicy::Shutdown => "io-error",
-        QuorumLossPolicy::Freeze => "suspend-io",
-    };
-    check_for(
-        name,
-        "on-no-quorum",
-        on_no_quorum_policy,
-        &resources[0].options.on_no_quorum,
-    );
-    check_for(
-        name,
-        "on-no-data-accessible",
-        on_no_quorum_policy,
-        &resources[0].options.on_no_data_accessible,
-    );
+    if split_brain_avoidance_policy == &SplitBrainAvoidancePolicy::Quorum {
+        let on_no_quorum_policy = match on_quorum_loss {
+            QuorumLossPolicy::Shutdown => "io-error",
+            QuorumLossPolicy::Freeze => "suspend-io",
+        };
+        check_is(
+            "on-no-quorum",
+            on_no_quorum_policy,
+            &res.options.on_no_quorum,
+        );
+        check_is(
+            "on-no-data-accessible",
+            on_no_quorum_policy,
+            &res.options.on_no_data_accessible,
+        );
 
-    if *on_quorum_loss == QuorumLossPolicy::Freeze {
-        for conn in &resources[0].connections {
-            check_for(name, "rr-conflict", "retry-connect", &conn.net.rr_conflict);
+        if *on_quorum_loss == QuorumLossPolicy::Freeze {
+            for conn in &res.connections {
+                check_is("rr-conflict", "retry-connect", &conn.net.rr_conflict);
+            }
+
+            if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+                warn!("You don't have unified cgroups, the plugin will not work as intended");
+            }
         }
-
-        if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-            warn!("You don't have unified cgroups, the plugin will not work as intended");
+    } else if split_brain_avoidance_policy == &SplitBrainAvoidancePolicy::Fencing {
+        for conn in &res.connections {
+            check_not("fencing", "dont-care", &conn.net.fencing);
         }
     }
 
     Ok(())
 }
 
-// inspired by https://crates.io/crates/uname
-// inlined because currently not packaged in Ubuntu Focal
-#[inline]
-fn to_cstr(buf: &[c_char]) -> &CStr {
-    unsafe { CStr::from_ptr(buf.as_ptr()) }
+fn get_preferred_nodes_sleep_s(preferred_nodes: &[String]) -> u64 {
+    let sleep = match utils::uname_n() {
+        Ok(node_name) => match preferred_nodes.iter().position(|n| n == &node_name) {
+            Some(pos) => pos,
+            None => preferred_nodes.len(),
+        },
+        Err(e) => {
+            warn!("Could not determine 'uname -n': {e}");
+            0
+        }
+    };
+
+    sleep as u64
 }
-pub fn uname_n() -> Result<String> {
-    let mut n = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::uname(&mut n) };
-    if r == 0 {
-        Ok(to_cstr(&n.nodename[..]).to_string_lossy().into_owned())
-    } else {
-        Err(anyhow::anyhow!(io::Error::last_os_error()))
+
+fn try_initial_target_start(name: &str) -> bool {
+    // if we know for sure that a remote is Primary, then we don't try
+    // in all other cases, even if unsure, we can try
+    match get_primary(name) {
+        Ok(PrimaryOn::Remote(_)) => false,
+        _ => true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drbd::Device;
+    use crate::drbd::{Connection, Device};
 
     #[test]
     fn sleep_before_promote_ms() {
@@ -1125,23 +1283,59 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            connections: vec![Connection {
+                connection: ConnectionState::NetworkFailure,
+                ..Default::default()
+            }],
             ..Default::default()
         };
         assert_eq!(
-            get_sleep_before_promote_ms(&r, &[], &QuorumLossPolicy::Shutdown, 1),
+            get_sleep_before_promote_ms(
+                &r,
+                &[],
+                &SplitBrainAvoidancePolicy::Quorum,
+                &QuorumLossPolicy::Shutdown,
+                5,
+                1
+            ),
             6000
         );
 
         r.role = Role::Secondary;
         assert_eq!(
-            get_sleep_before_promote_ms(&r, &[], &QuorumLossPolicy::Freeze, 1),
+            get_sleep_before_promote_ms(
+                &r,
+                &[],
+                &SplitBrainAvoidancePolicy::Quorum,
+                &QuorumLossPolicy::Freeze,
+                5,
+                1
+            ),
             6000 + 2000
         );
         assert_eq!(
-            get_sleep_before_promote_ms(&r, &[], &QuorumLossPolicy::Shutdown, 2),
+            get_sleep_before_promote_ms(
+                &r,
+                &[],
+                &SplitBrainAvoidancePolicy::Quorum,
+                &QuorumLossPolicy::Shutdown,
+                5,
+                2
+            ),
             12000
         );
-        if let Ok(node_name) = uname_n() {
+        assert_eq!(
+            get_sleep_before_promote_ms(
+                &r,
+                &[],
+                &SplitBrainAvoidancePolicy::Fencing,
+                &QuorumLossPolicy::Shutdown,
+                5,
+                1
+            ),
+            6000 + 5000
+        );
+        if let Ok(node_name) = utils::uname_n() {
             assert_eq!(
                 get_sleep_before_promote_ms(
                     &r,
@@ -1151,7 +1345,9 @@ mod tests {
                         node_name.clone(),
                         "".to_string()
                     ],
+                    &SplitBrainAvoidancePolicy::Quorum,
                     &QuorumLossPolicy::Shutdown,
+                    5,
                     1
                 ),
                 6000 + 2000
@@ -1160,7 +1356,9 @@ mod tests {
                 get_sleep_before_promote_ms(
                     &r,
                     &["".to_string(), "".to_string(), "".to_string()],
+                    &SplitBrainAvoidancePolicy::Quorum,
                     &QuorumLossPolicy::Shutdown,
+                    5,
                     1
                 ),
                 6000 + 3000

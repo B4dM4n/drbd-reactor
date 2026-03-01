@@ -30,7 +30,7 @@ is a dependency for all the other units from
 (according overrides are generated).
 .It
 a
-.Sy drbd-resource@
+.Sy drbd-services@
 target that subsumes all the generated dependencies from the
 .Sy start
 list.
@@ -68,7 +68,7 @@ containing dependencies on
 and on
 .Sy b.service .
 .It
-.Pa /var/run/systemd/system/drbd-resource@foo.target.d/reactor.conf
+.Pa /var/run/systemd/system/drbd-services@foo.target.d/reactor.conf
 containing dependencies on
 .Sy a.service ,
 .Sy b.service ,
@@ -80,7 +80,7 @@ If a DRBD resource changes its state to
 .Dq may promote ,
 the plugin (i.e., all plugins on all nodes in the cluster)
 start the generated systemd target (e.g.,
-.Sy drbd-resource@foo.target
+.Sy drbd-services@foo.target
 ). All will try to start the
 .Sy drbd-promote@
 unit first, but only one will succeed and continue to start the rest of the
@@ -318,12 +318,77 @@ run all services, some users like to add preferences for nodes. This can be
 done by setting a list of 
 .Sy preferred-nodes .
 On resource startup a delay based on the node's position in the list is added.
-Nodes with a lower preference will sleep longer. If a node joins on DRBD
-level, and that peer's disk becomes
+Node names need to match the output of
+.Sy uname -n .
+Nodes with a lower preference will sleep longer. By default, if a node joins
+on DRBD level, and that peer's disk becomes
 .Sy UpToDate ,
 and the peer has a higher preference, then the active node stops the services
 locally. As it will then have a higher sleep penalty as the preferred node,
-the preferred one will take over the service (if it can).
+the preferred one will take over the service (if it can). If
+.Sy preferred-nodes-policy
+is set to
+.Sy always
+the system behaves as described above.
+If it is set to
+.Sy start-only ,
+then preferred nodes are only taken into account when a service can be
+startet, but it will not fall back to a more preferred node when the service
+is already running on a lower priority node and a higher priority nodes joins
+later.
+.Sh TWO NODE CLUSTERS WITH FENCING
+If possible the promoter plugin should be used in setups that allow for DRBD
+quorum. Two node clusters with properly configured fencing are the exception.
+We only support fencing as split-brain avoidance mechanism in two node
+clusters, everything else should use DRBD quorum. The policy gets auto
+detected as follows:
+.Bl -bullet -compact
+.It
+if DRBD quorum is something other than
+.Dq off ,
+.Sy quorum
+is used
+.It
+if DRBD quorum is
+.Dq off
+and DRBD fencing is something other than
+.Dq dont-care ,
+.Sy fencing
+is used
+.El
+Before a secondary attempts to promote, it has to give the primary some time
+to fence the secondary. This should usually be fast (i.e., remotely switching
+off power). In
+.Sy fencing
+mode the value of
+.Sy fencing-promote-delay
+is used to sleep the given number of seconds before the promote attempt.
+.Sh ADJUSTING RESOURCES ON START
+When the promoter plugin starts, it runs
+.Sy drbdadm adjust
+on all configured resources by default. This ensures that the DRBD resource
+configuration on disk matches the running kernel state. The plugin waits for
+the backing devices to become available before running
+.Sy adjust .
+.Pp
+This behavior can be disabled per resource by setting
+.Sy adjust-resource-on-start
+to
+.Sy false .
+Disabling it may be useful if
+.Sy drbdadm adjust
+is managed externally, or if its execution during startup causes undesirable
+side effects in a specific setup.
+.Sh LOCAL DISK FAILURE
+If the local DRBD disk on a Primary node gets detached
+(i.e., becomes Diskless), the behavior is controlled by the
+.Sy on-disk-detach
+policy. By default the policy is set to
+.Dq ignore ,
+which means no action is taken. If set to
+.Dq fail-over ,
+the promoter will stop services if an UpToDate peer is
+found, triggering a failover to that peer.
 .Sh FILES
 .Bl -tag -compact
 .It Pa /usr/lib/ocf/resource.d/

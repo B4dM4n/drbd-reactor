@@ -1,7 +1,7 @@
 %define debug_package %{nil}
 
 Name:		drbd-reactor
-Version:	1.6.0~rc.1
+Version:	1.11.0
 Release:	1
 Summary:	React to DRBD events via plugins.
 %global	tarball_version %(echo "%{version}" | sed -e 's/~rc/-rc/' -e 's/~alpha/-alpha/')
@@ -62,6 +62,36 @@ install -D -m644 %{_builddir}/%{name}-%{tarball_version}/example/ctl.completion.
 
 
 %changelog
+* Wed Feb 25 2026 Roland Kammerer <roland.kammerer@linbit.com> - 1.11.0-1
+-  New upstream release
+
+* Tue Feb 17 2026 Roland Kammerer <roland.kammerer@linbit.com> - 1.11.0~rc.1-1
+-  New upstream release
+
+* Tue Oct 14 2025 Roland Kammerer <roland.kammerer@linbit.com> - 1.10.0-1
+-  New upstream release
+
+* Tue Oct 07 2025 Roland Kammerer <roland.kammerer@linbit.com> - 1.10.0~rc.1-1
+-  New upstream release
+
+* Tue Jul 08 2025 Roland Kammerer <roland.kammerer@linbit.com> - 1.9.0-1
+-  New upstream release
+
+* Tue Jul 01 2025 Roland Kammerer <roland.kammerer@linbit.com> - 1.9.0~rc.1-1
+-  New upstream release
+
+* Tue Feb 11 2025 Roland Kammerer <roland.kammerer@linbit.com> - 1.8.0-1
+-  New upstream release
+
+* Wed Feb 05 2025 Roland Kammerer <roland.kammerer@linbit.com> - 1.8.0~rc.1-1
+-  New upstream release
+
+* Thu Dec 19 2024 Roland Kammerer <roland.kammerer@linbit.com> - 1.7.0-1
+-  New upstream release
+
+* Fri Nov 22 2024 Roland Kammerer <roland.kammerer@linbit.com> - 1.6.0-1
+-  New upstream release
+
 * Fri Nov 15 2024 Roland Kammerer <roland.kammerer@linbit.com> - 1.6.0~rc.1-1
 -  New upstream release
 

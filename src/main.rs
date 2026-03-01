@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs::read_to_string;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{io, sync, thread};
@@ -181,9 +182,7 @@ fn init_loggers(log_cfgs: Vec<config::LogConfig>) -> Result<()> {
 fn main() -> Result<()> {
     let cli_opt = CliOpt::from_args();
 
-    let tty = atty::is(atty::Stream::Stdin)
-        || atty::is(atty::Stream::Stdout)
-        || atty::is(atty::Stream::Stderr);
+    let tty = io::stdin().is_terminal() || io::stdout().is_terminal() || io::stderr().is_terminal();
     if tty && !cli_opt.allow_tty {
         return Err(anyhow::anyhow!(
             "Refusing to start in a terminal without --allow-tty. Did you mean drbd-reactorctl?"
@@ -200,7 +199,7 @@ fn main() -> Result<()> {
     let statistics_poll = Duration::from_secs(cfg.statistics_poll_interval);
     thread::spawn(move || {
         if let Err(e) = events2(e2tx, statistics_poll) {
-            error!("main: events2 processing failed: {}", e);
+            error!("main: events2 processing failed: {e}");
             std::process::exit(1);
         }
     });
@@ -211,12 +210,16 @@ fn main() -> Result<()> {
     loop {
         match get_config(&cli_opt.config) {
             Ok(new) => cfg = new,
-            Err(e) => warn!("main: failed to reload config, reusing old: {}", e),
+            Err(e) => warn!("main: failed to reload config, reusing old: {e}"),
         };
         debug!("main: configuration: {:#?}", cfg);
 
         plugin::start_from_config(cfg.plugins.clone(), &mut started)?;
         debug!("main: started.len()={}", started.len());
+
+        let cfgs = started.keys().cloned().collect();
+        let _monitor_guard =
+            plugin::MonitorGuard::new(cfgs, cfg.snippets.clone(), cfg.snippets_monitoring_interval);
 
         let reason = core
             .run(&e2rx, &started)
@@ -285,8 +288,7 @@ fn min_drbd_versions() -> Result<()> {
     };
     if drbd_versions.utils < want {
         return Err(anyhow::anyhow!(
-            "drbdsetup minimum version ('{}') not fulfilled by '{}'",
-            want,
+            "drbdsetup minimum version ('{want}') not fulfilled by '{}'",
             drbd_versions.utils
         ));
     }
@@ -306,9 +308,7 @@ fn min_drbd_versions() -> Result<()> {
     };
     if kmod < want {
         return Err(anyhow::anyhow!(
-            "DRBD kernel module minimum version ('{}') not fulfilled by '{}'",
-            want,
-            kmod
+            "DRBD kernel module minimum version ('{want}') not fulfilled by '{kmod}'"
         ));
     }
 
@@ -351,10 +351,7 @@ fn read_config(config_file: &PathBuf) -> Result<config::Config> {
     content.push_str("\n# Content from snippets:\n");
     content.push_str(&snippets);
     config = toml::from_str(&content).with_context(|| {
-        format!(
-            "Could not parse config files including snippets; content: {}",
-            content
-        )
+        format!("Could not parse config files including snippets; content: {content}")
     })?;
 
     Ok(config)

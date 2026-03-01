@@ -21,6 +21,7 @@
 .Nm status
 .Op Fl -resource
 .Op Fl -verbose
+.Op Fl -json
 .Op Ar
 .Nm evict
 .Op Fl -delay
@@ -121,12 +122,17 @@ You might want to use
 instead.
 .El
 .Ss status
-print the status of a plugin.
+print the status of a plugin. In case of the promoter plugin the symbols and
+colors follow the ones from
+.Xr systemctl 1
+.Ar status .
 .Bl -tag -width Ds
 .It Fl r, -resource Ar resource...
 In case of a promoter plugin limit to these DRBD resources.
 .It Fl -verbose
 verbose output depending on the plugin type.
+.It Fl -json
+output machine parsable json output.
 .El
 .Ss evict
 Evicts a promoter resource from the currently active node.
@@ -206,7 +212,7 @@ INFO: To resume normal operation, execute:
 - systemctl start drbd-services@linstor_db.target # on this node
 - drbd-reactorctl enable /etc/drbd-reactor.d/linstor_db.toml.disabled # on all cluster nodes
 .Ed
-The command show will generate all the usual overrides and then start the
+The command will generate all the usual overrides and then start the
 implicit service responsible for DRBD device promotion and all the services
 (with their overrides) in the start list until and including the one given on
 the command line. After you are done, follow the instructions that

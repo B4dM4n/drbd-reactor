@@ -19,6 +19,10 @@ pub struct Config {
     #[serde(default = "default_statistics")]
     pub statistics_poll_interval: u64,
 
+    // seconds
+    #[serde(default = "default_snippets_monitoring")]
+    pub snippets_monitoring_interval: u64,
+
     #[serde(default)]
     pub snippets: Option<PathBuf>,
 
@@ -48,7 +52,7 @@ fn unspecified_ser<S>(port: &u16, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&format!(":{}", port))
+    serializer.serialize_str(&format!(":{port}"))
 }
 
 fn unspecified_de<'de, D>(deserializer: D) -> Result<u16, D::Error>
@@ -82,7 +86,7 @@ impl fmt::Display for LocalAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LocalAddress::Explicit(socket) => socket.fmt(f),
-            LocalAddress::Unspecified(port) => write!(f, ":{}", port),
+            LocalAddress::Unspecified(port) => write!(f, ":{port}"),
         }
     }
 }
@@ -95,6 +99,10 @@ impl Default for LocalAddress {
 
 fn default_statistics() -> u64 {
     60
+}
+
+fn default_snippets_monitoring() -> u64 {
+    120
 }
 
 fn default_level() -> LevelFilter {

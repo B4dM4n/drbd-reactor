@@ -26,7 +26,7 @@ is defined via the list specified via `start = []`. The plugin generates two imp
 
 - a `drbd-promote@` override that promotes the DRBD resource (i.e., switches it to Primary). This is a
 dependency for all the other units from `start` (according overrides are generated).
-- a `drbd-resource@` target that subsumes all the generated dependencies from the `start` list.
+- a `drbd-services@` target that subsumes all the generated dependencies from the `start` list.
 
 Let's look at a simple example to see which overrides get generated from a dummy start list like this:
 
@@ -43,11 +43,11 @@ start = [ "a.service", "b.service", "c.service" ]
   `a.service`.
 - `/var/run/systemd/system/c.service.d/reactor.conf` containing dependencies on `drbd-promote@foo` and on
   `b.service`.
-- `/var/run/systemd/system/drbd-resource@foo.target.d/reactor.conf` containing dependencies on
+- `/var/run/systemd/system/drbd-services@foo.target.d/reactor.conf` containing dependencies on
   `a.service`, `b.service`, and `c.service`.
 
 If a DRBD resource changes its state to "may promote", the plugin (i.e., all plugins on all nodes in the cluster)
-start the generated systemd target (e.g., `drbd-resource@foo.target`). All will try to start the
+start the generated systemd target (e.g., `drbd-services@foo.target`). All will try to start the
 `drbd-promote@` unit first, but only one will succeed and continue to start the rest of the services. All the
 others will fail intentionally.
 
@@ -69,6 +69,16 @@ The configuration also contains a `runner` that can be set to `shell`. Then the 
 scripts and started in order (no explicit targets or anything) and stopped in reverse order or as defined via
 `stop`. This can be used on systems without systemd and might be useful for Windows systems in the future. If
 you can, use the default systemd method, it is the preferred one.
+
+## Adjusting resources on start
+
+When the promoter plugin starts, it runs `drbdadm adjust` on all configured resources by default. This ensures
+that the DRBD resource configuration on disk matches the running kernel state. The plugin waits for the
+backing devices to become available before running `adjust`.
+
+This behavior can be disabled per resource by setting `adjust-resource-on-start` to `false`. Disabling it
+may be useful if `drbdadm adjust` is managed externally, or if its execution during startup causes
+undesirable side effects in a specific setup.
 
 ## Service dependencies
 Let's get back to our simple example with `start = [ "a.service", "b.service", "c.service" ]`. As we noted in
@@ -156,6 +166,15 @@ options {
 auto-configuration, you as the admin are the one that should understand your system, but it checks properties
 and writes warnings to the log (file/journal) if misconfiguration is detected.
 
+A note on LINSTOR: LINSTOR created resources obviously can be used with `drbd-reactor`, but one should always
+make sure to create a LINSTOR resource group, set all required options on the resource group, and then spawn
+DRBD resource from that resource group. If a LINSTOR resource is created manually (i.e., `linstor resource
+create ...` and friends) it implicitly gets assigned to LINSTOR's default resource group. If later properties
+of that resource group change, they are passed down to the DRBD resources, which might have unforeseen
+consequences. It is always a good idea to create dedicated LINSTOR resource groups for reactor controlled DRBD
+resources. This could for example be one resource group for DRBD resources that should allow freezing, one for
+DRBD resources that don't, and one for LINSTOR controller HA.
+
 # Handled (failure-) scenarios
 
 ## Promotion and Service Start
@@ -207,6 +226,13 @@ details.
 ## Node failure
 
 The peers will see replication links go down, the resource becomes promotable. See above.
+
+## Local disk failure
+
+If the local DRBD disk on a Primary node gets detached (i.e., becomes Diskless), the behavior is controlled
+by the `on-disk-detach` policy. By default the policy is set to `ignore`, which means no action is taken.
+If set to `fail-over`, the promoter will stop services if an UpToDate peer is found, triggering a failover
+to that peer.
 
 ## Service failure
 
@@ -310,7 +336,23 @@ start = ["ocf:heartbeat:Filesystem fs_test device=/dev/drbd1000 directory=/mnt/t
 # Preferred Nodes
 While in a HA cluster that deserves the name every node needs to be able to run all services, some users like
 to add preferences for nodes. This can be done by setting a list of `preferred-nodes`.  On resource startup a
-delay based on the node's position in the list is added.  Nodes with a lower preference will sleep longer. If
-a node joins on DRBD level, and that peer's disk becomes `UpToDate`, and the peer has a higher preference, then
-the active node stops the services locally. As it will then have a higher sleep penalty as the preferred
-node, the preferred one will take over the service (if it can).
+delay based on the node's position in the list is added. Node names need to match the output of `uname -n`.
+Nodes with a lower preference will sleep longer. By default, if a node joins on DRBD level, and that peer's
+disk becomes `UpToDate`, and the peer has a higher preference, then the active node stops the services
+locally. As it will then have a higher sleep penalty as the preferred node, the preferred one will take over
+the service (if it can). If `preferred-nodes-policy` is set to `always` the system behaves as described above.
+If it is set to `start-only`, then preferred nodes are only taken into account when a service can be startet,
+but it will not fall back to a more preferred node when the service is already running on a lower priority
+node and a higher priority nodes joins later.
+
+# Two node clusters with fencing
+If possible the promoter plugin should be used in setups that allow for DRBD quorum. Two node clusters with
+properly configured fencing are the exception. We only support fencing as split-brain avoidance mechanism in
+two node clusters, everything else should use DRBD quorum. The policy gets auto detected as follows:
+
+- if DRBD quorum is something other than "off", `quorum` is used
+- if DRBD quorum is "off" and DRBD fencing is something other than "dont-care", `fencing` is used
+
+Before a secondary attempts to promote, it has to give the primary some time to fence the secondary. This
+should usually be fast (i.e., remotely switching off power). In `fencing` mode the value of
+`fencing-promote-delay` is used to sleep the given number of seconds before the promote attempt.

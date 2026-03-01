@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
+use std::fmt::Write as fmtWrite;
 use std::fs;
 use std::io::{self, Write};
 use std::io::{BufRead, BufReader};
@@ -14,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{crate_authors, crate_version, App, AppSettings, Arg, ArgMatches, Shell, SubCommand};
+use clap::{crate_version, App, AppSettings, Arg, ArgMatches, Shell, SubCommand};
 use colored::Colorize;
 use regex::Regex;
 use serde::Deserialize;
@@ -24,10 +25,12 @@ use tempfile::NamedTempFile;
 
 use drbd_reactor::config;
 use drbd_reactor::drbd;
+use drbd_reactor::drbd::PrimaryOn;
 use drbd_reactor::plugin;
 use drbd_reactor::plugin::promoter;
 use drbd_reactor::systemd;
 use drbd_reactor::systemd::UnitActiveState;
+use drbd_reactor::utils;
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
@@ -164,24 +167,28 @@ fn main() -> Result<()> {
         }
         ("status", Some(status_matches)) => {
             let verbose = status_matches.is_present("verbose");
+            let format = match status_matches.is_present("json") {
+                true => Format::Json,
+                false => Format::Terminal,
+            };
             let resources = status_matches.values_of("resource").unwrap_or_default();
             let resources: Vec<String> = resources.map(String::from).collect::<Vec<_>>();
             status(
                 expand_snippets(&snippets_path, status_matches, false),
-                verbose,
                 &resources,
                 &cluster,
             )
+            .and_then(|s| Ok(print!("{}", s.format(&format, verbose)?)))
         }
         _ => {
             // pretend it is status
             let args: ArgMatches = Default::default();
             status(
                 expand_snippets(&snippets_path, &args, false),
-                false,
                 &vec![],
                 &cluster,
             )
+            .and_then(|s| Ok(print!("{}", s.format(&Format::Terminal, false)?)))
         }
     }
 }
@@ -208,14 +215,14 @@ fn ask(question: &str, default: bool) -> Result<bool> {
             "" => return Ok(default),
             "y" | "yes" => return Ok(true),
             "n" | "no" => return Ok(false),
-            x => println!("Unknown answer '{}', use 'y' or 'n'", x),
+            x => println!("Unknown answer '{x}', use 'y' or 'n'"),
         }
     }
 }
 
 fn edit_editor(tmppath: &Path, editor: &str, type_opt: &str, force: bool) -> Result<()> {
     let len_err =
-        || -> Result<()> { Err(anyhow::anyhow!("Expected excactly one {} plugin", type_opt)) };
+        || -> Result<()> { Err(anyhow::anyhow!("Expected excactly one {type_opt} plugin")) };
 
     plugin::map_status(Command::new(editor).arg(tmppath).status())?;
 
@@ -263,7 +270,7 @@ fn edit_editor(tmppath: &Path, editor: &str, type_opt: &str, force: bool) -> Res
             return len_err();
         }
     } else {
-        return Err(anyhow::anyhow!("Unknown type ('{}') to edit", type_opt));
+        return Err(anyhow::anyhow!("Unknown type ('{type_opt}') to edit"));
     }
 
     Ok(())
@@ -335,7 +342,7 @@ fn edit(
                 "agentx" => AGENTX_TEMPLATE,
                 "umh" => UMH_TEMPLATE,
                 "debugger" => DEBUGGER_TEMPLATE,
-                x => return Err(anyhow::anyhow!("Unknown type ('{}') to edit", x)),
+                x => return Err(anyhow::anyhow!("Unknown type ('{x}') to edit")),
             };
             tmpfile.write_all(template.as_bytes())?;
             tmpfile.flush()?;
@@ -421,8 +428,7 @@ fn start_until_list(config: promoter::PromoterOptResource, until: &str) -> Resul
             match config.start.iter().position(|s| s == until) {
                 Some(n) => Ok(config.start.into_iter().take(n + 1).collect()),
                 None => Err(anyhow::anyhow!(
-                    "Could not find unit '{}' in start list",
-                    until
+                    "Could not find unit '{until}' in start list"
                 )),
             }
         }
@@ -575,19 +581,19 @@ fn reload_service() -> Result<()> {
 
 fn status(
     snippets_paths: Vec<PathBuf>,
-    verbose: bool,
     resources: &Vec<String>,
     cluster: &ClusterConf,
-) -> Result<()> {
+) -> Result<Status> {
+    let mut status = Status {
+        ..Default::default()
+    };
     if do_remote(cluster)? {
-        return Ok(());
+        return Ok(status);
     }
 
     for snippet in snippets_paths {
-        println!("{}:", snippet.display());
         let conf = read_config(&snippet)?;
         let plugins = conf.plugins;
-        let me = promoter::uname_n()?;
         for promoter in plugins.promoter {
             for (drbd_res, config) in promoter.resources {
                 // check if in filter
@@ -595,76 +601,57 @@ fn status(
                     continue;
                 }
                 let target = systemd::escaped_services_target(&drbd_res);
-                let primary = get_primary(&drbd_res).unwrap_or(UNKNOWN.to_string());
-                let primary = if primary == me {
-                    "this node".to_string()
-                } else {
-                    format!("node '{}'", primary)
-                };
-                println!("Promoter: Currently active on {}", primary);
+                let primary_on = drbd::get_primary(&drbd_res)?;
                 // target itself and the implicit one
                 let promote_service = promote_service(&drbd_res);
-                if verbose {
-                    // systemctl status in this case returns != 0 if service not started
-                    // but we expect that on n-1 nodes and we don't want to fail in this case
-                    let _ = systemctl(vec!["status".into(), "--no-pager".into(), target]);
-                    let _ = systemctl(vec!["status".into(), "--no-pager".into(), promote_service]);
-                } else {
-                    println!("{} {}", status_dot(&target)?, target);
-                    println!("{} ├─ {}", status_dot(&promote_service)?, promote_service);
+                let mut dependencies = Vec::new();
+                let target = SystemdUnit::from_str(&target)?;
+                dependencies.push(SystemdUnit::from_str(&promote_service)?);
+                let state = target.status.clone();
+
+                for start in config.start {
+                    let service_name = service_name(&start, &drbd_res)?;
+                    dependencies.push(SystemdUnit::from_str(&service_name)?);
                 }
-                for (i, start) in config.start.iter().enumerate() {
-                    let service_name = service_name(start, &drbd_res)?;
-                    if verbose {
-                        // systemctl status in this case returns != 0 if service not started
-                        // but we expect that on n-1 nodes and we don't want to fail in this case
-                        let _ = systemctl(vec!["status".into(), "--no-pager".into(), service_name]);
-                    } else {
-                        let sep = if i == config.start.len() - 1 {
-                            "└─"
-                        } else {
-                            "├─"
-                        };
-                        println!(
-                            "{} {} {} {}",
-                            status_dot(&service_name)?,
-                            sep,
-                            service_name,
-                            freezer_state(&service_name)?
-                        );
-                    }
-                }
+
+                status.promoter.push(PromoterStatus {
+                    drbd_resource: drbd_res.clone(),
+                    path: snippet.clone(),
+                    primary_on,
+                    target,
+                    dependencies,
+                    status: state,
+                });
             }
         }
         for prometheus in plugins.prometheus {
-            println!(
-                "Prometheus: listening on {}",
-                prometheus.address.to_string().bold().green()
-            );
-            if verbose {
-                for addr in prometheus.address.to_socket_addrs()? {
-                    let status = match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
-                        Ok(_) => format!("{}", "success".bold().green()),
-                        Err(e) => format!("{} ({})", "failed".bold().red(), e),
-                    };
-                    println!("TCP Connect ({}): {}", addr, status);
-                }
-            }
+            status.prometheus.push(PrometheusStatus {
+                path: snippet.clone(),
+                address: prometheus.address.clone(),
+                status: UnitActiveState::Active,
+            })
         }
         for _ in plugins.debugger {
-            println!("Debugger: {}", "started".bold().green());
+            status.debugger.push(DebuggerStatus {
+                path: snippet.clone(),
+                status: UnitActiveState::Active,
+            })
         }
         for _ in plugins.umh {
-            println!("UMH: {}", "started".bold().green());
+            status.umh.push(UMHStatus {
+                path: snippet.clone(),
+                status: UnitActiveState::Active,
+            })
         }
         for agentx in plugins.agentx {
-            println!(
-                "AgentX: connecting to main agent at {}",
-                agentx.address.bold().green()
-            );
+            status.agentx.push(AgentXStatus {
+                path: snippet.clone(),
+                address: agentx.address.clone(),
+                status: UnitActiveState::Active,
+            })
         }
     }
-    Ok(())
+    Ok(status)
 }
 
 fn cat(snippets_paths: Vec<PathBuf>, cluster: &ClusterConf) -> Result<()> {
@@ -717,70 +704,22 @@ fn evict_unmask_and_start(drbd_resources: &Vec<String>) -> Result<()> {
     Ok(())
 }
 
-const UNKNOWN: &str = "<unknown>";
-fn get_primary(drbd_resource: &str) -> Result<String> {
-    let output = Command::new("drbdsetup")
-        .arg("status")
-        .arg("--json")
-        .arg(drbd_resource)
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "'drbdsetup show' not executed successfully"
-        ));
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    struct Resource {
-        role: drbd::Role,
-        connections: Vec<Connection>,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    struct Connection {
-        name: String,
-        peer_role: drbd::Role,
-    }
-    let resources: Vec<Resource> = serde_json::from_slice(&output.stdout)?;
-    if resources.len() != 1 {
-        return Err(anyhow::anyhow!(
-            "resources length from drbdsetup status not exactly 1"
-        ));
-    }
-
-    // is it me?
-    if resources[0].role == drbd::Role::Primary {
-        return promoter::uname_n();
-    }
-
-    // a peer?
-    for conn in &resources[0].connections {
-        if conn.peer_role == drbd::Role::Primary {
-            return Ok(conn.name.clone());
-        }
-    }
-
-    Ok(UNKNOWN.to_string())
-}
-
-fn evict_resource(drbd_resource: &str, delay: u32, me: &str) -> Result<()> {
+fn evict_resource(drbd_resource: &str, delay: u32) -> Result<()> {
     println!("Evicting {}", drbd_resource);
-    let mut primary = get_primary(drbd_resource)?;
-    if primary == UNKNOWN {
-        println!(
-            "Sorry, resource state for '{}' unknown, ignoring",
-            drbd_resource
-        );
-        return Ok(());
-    }
-    if primary != me {
-        println!(
-            "Active on '{}', nothing to do on this node, ignoring",
-            primary,
-        );
-        return Ok(());
-    }
+    match drbd::get_primary(drbd_resource)? {
+        PrimaryOn::None => {
+            println!(
+                "Sorry, resource state for '{}' unknown, ignoring",
+                drbd_resource
+            );
+            return Ok(());
+        }
+        PrimaryOn::Remote(r) => {
+            println!("Active on '{}', nothing to do on this node, ignoring", r,);
+            return Ok(());
+        }
+        PrimaryOn::Local(_) => (), // we continue
+    };
 
     let target = systemd::escaped_services_target(drbd_resource);
     systemctl(vec!["mask".into(), "--runtime".into(), target.clone()])?;
@@ -789,9 +728,8 @@ fn evict_resource(drbd_resource: &str, delay: u32, me: &str) -> Result<()> {
 
     let mut needs_newline = false;
     for i in (0..=delay).rev() {
-        primary = get_primary(drbd_resource)?;
-        if primary != UNKNOWN && primary != me {
-            // a know host/peer
+        // a know host/peer?
+        if let PrimaryOn::Remote(_r) = drbd::get_primary(drbd_resource)? {
             break;
         }
 
@@ -815,23 +753,23 @@ fn evict_resource(drbd_resource: &str, delay: u32, me: &str) -> Result<()> {
         println!();
     }
 
-    if primary == UNKNOWN {
-        println!("Unfortunately no other node took over, resource in unknown state");
-    } else if primary == me {
-        println!("Local node still DRBD Primary, not all services stopped in time locally");
-    } else {
-        println!("Node '{}' took over", primary);
-    }
+    match drbd::get_primary(drbd_resource)? {
+        PrimaryOn::Local(_) => {
+            println!("Local node still DRBD Primary, not all services stopped in time locally");
+        }
+        PrimaryOn::Remote(r) => println!("Node '{}' took over", r),
+        PrimaryOn::None => {
+            println!("Unfortunately no other node took over, resource in unknown state")
+        }
+    };
 
     Ok(())
 }
 
 fn evict_resources(drbd_resources: &Vec<String>, keep_masked: bool, delay: u32) -> Result<()> {
-    let me = promoter::uname_n()?;
-
     TERMINATE.store(false, Ordering::Relaxed);
     for drbd_res in drbd_resources {
-        let result = evict_resource(drbd_res, delay, &me);
+        let result = evict_resource(drbd_res, delay);
         if !keep_masked {
             evict_unmask_and_start(&vec![drbd_res.clone()])?;
         }
@@ -983,10 +921,7 @@ fn read_config(snippet_path: &Path) -> Result<config::Config> {
     let content = config::read_snippets(&[snippet_path])
         .with_context(|| "Could not read config snippets".to_string())?;
     let config = toml::from_str(&content).with_context(|| {
-        format!(
-            "Could not parse config files including snippets; content: {}",
-            content
-        )
+        format!("Could not parse config files including snippets; content: {content}")
     })?;
 
     Ok(config)
@@ -1107,7 +1042,7 @@ fn cfg_dir() -> Result<PathBuf> {
 }
 
 fn read_ctl_config(context: &str, additional_content: Option<&str>) -> Result<Config> {
-    let cfg_file = cfg_dir()?.join(format!("{}.toml", context));
+    let cfg_file = cfg_dir()?.join(format!("{context}.toml"));
 
     // it is fine if the default.toml symlink does not exist
     if context == "default" && !cfg_file.exists() {
@@ -1122,12 +1057,8 @@ fn read_ctl_config(context: &str, additional_content: Option<&str>) -> Result<Co
         content.push_str(ac);
     }
 
-    toml::from_str(&content).with_context(|| {
-        format!(
-            "Could not parse drbd-reactorctl config file; content: {}",
-            content
-        )
-    })
+    toml::from_str(&content)
+        .with_context(|| format!("Could not parse drbd-reactorctl config file; content: {content}"))
 }
 
 fn read_nodes(cluster: &ClusterConf) -> Result<Vec<Node>> {
@@ -1204,7 +1135,7 @@ fn do_remote(cluster: &ClusterConf) -> Result<bool> {
     }
 
     // remote execution (except local node)
-    let me = promoter::uname_n()?;
+    let me = utils::uname_n_once();
 
     // check if we can reach all nodes, otherwise we might run into some inconsistent cluster state
     // that is obviously not a 100% guarantee, but IMO a check worth having
@@ -1212,7 +1143,7 @@ fn do_remote(cluster: &ClusterConf) -> Result<bool> {
     io::stdout().flush()?;
     let mut cmds = Vec::new();
     for node in &nodes {
-        if node.hostname == me {
+        if node.hostname == *me {
             continue;
         }
         let userhost = format!("{}@{}", node.user, node.hostname);
@@ -1229,7 +1160,7 @@ fn do_remote(cluster: &ClusterConf) -> Result<bool> {
     let orig_args: Vec<String> = env::args().skip(1).collect();
     cmds.clear();
     for node in &nodes {
-        let is_me = me == node.hostname;
+        let is_me = *me == node.hostname;
         let mut node_args = Vec::new();
         if !is_me {
             node_args.push("ssh".to_string());
@@ -1260,7 +1191,7 @@ fn do_remote(cluster: &ClusterConf) -> Result<bool> {
 
 fn get_app() -> App<'static, 'static> {
     App::new("drbd-reactorctl")
-        .author(crate_authors!("\n"))
+        .author("Roland Kammerer <roland.kammerer@linbit.com>\nMoritz Wanzenböck <moritz.wanzenboeck@linbit.com>")
         .version(crate_version!())
         .about("Controls a local drbd-reactor daemon")
         .setting(AppSettings::VersionlessSubcommands)
@@ -1295,7 +1226,7 @@ fn get_app() -> App<'static, 'static> {
                 .arg(
                     Arg::with_name("now")
                         .long("now")
-                        .help("In case of promoter plugin stop the drbd-resources target"),
+                        .help("In case of promoter plugin stop the drbd-services target"),
                 )
                 .arg(
                     Arg::with_name("configs")
@@ -1320,6 +1251,11 @@ fn get_app() -> App<'static, 'static> {
                         .help("Verbose output")
                         .short("v")
                         .long("verbose"),
+                )
+                .arg(
+                    Arg::with_name("json")
+                        .help("Json output")
+                        .long("json"),
                 )
                 .arg(
                     Arg::with_name("resource")
@@ -1521,29 +1457,18 @@ fn systemctl(args: Vec<String>) -> Result<()> {
     systemctl_out_err(args, Stdio::inherit(), Stdio::inherit())
 }
 
-fn status_dot(unit: &str) -> Result<String> {
-    let prop = systemd::show_property(unit, "ActiveState")?;
-    let state = UnitActiveState::from_str(&prop)?;
-    Ok(format!("{}", state))
-}
-
-fn freezer_state(unit: &str) -> Result<String> {
-    // we can not always expect a value on older systemd that did not have freeze support
-    // in that case we get an Err() which we discard.
-    let prop = match systemd::show_property(unit, "FreezerState") {
-        Ok(x) => x,
-        Err(_) => return Ok("".into()),
-    };
-    let state = UnitFreezerState::from_str(&prop)?;
-    Ok(format!("{}", state))
-}
-
 // most of that inspired by systemc/src/basic/unit-def.c
 enum UnitFreezerState {
     Running,
     Freezing,
     Frozen,
     Thawing,
+    Unknown,
+}
+impl Serialize for UnitFreezerState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
 }
 impl FromStr for UnitFreezerState {
     type Err = Error;
@@ -1554,6 +1479,7 @@ impl FromStr for UnitFreezerState {
             "freezing" => Ok(Self::Freezing),
             "frozen" => Ok(Self::Frozen),
             "thawing" => Ok(Self::Thawing),
+            "unknown" => Ok(Self::Unknown),
             _ => Err(Error::new(
                 ErrorKind::InvalidData,
                 "unknown systemd FreezerState",
@@ -1565,11 +1491,230 @@ impl FromStr for UnitFreezerState {
 impl fmt::Display for UnitFreezerState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Running => write!(f, ""),
-            Self::Freezing => write!(f, "({})", "freezing".blue()),
-            Self::Frozen => write!(f, "({})", "frozen".blue()),
-            Self::Thawing => write!(f, "(thawing)"),
+            Self::Running => write!(f, "running"),
+            Self::Freezing => write!(f, "freezing"),
+            Self::Frozen => write!(f, "frozen"),
+            Self::Thawing => write!(f, "thawing"),
+            Self::Unknown => write!(f, "unknown"),
         }
+    }
+}
+
+impl UnitFreezerState {
+    fn terminal(&self, _verbose: bool) -> Result<String> {
+        Ok(match self {
+            Self::Running => "".to_string(),
+            Self::Freezing => "freezing".blue().to_string(),
+            Self::Frozen => "frozen".blue().to_string(),
+            Self::Thawing => "thawing".to_string(),
+            Self::Unknown => "unknown".to_string(),
+        })
+    }
+}
+
+enum Format {
+    Terminal,
+    Json,
+}
+impl FromStr for Format {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Error> {
+        match input {
+            "text" => Ok(Self::Terminal),
+            "json" => Ok(Self::Json),
+            _ => Err(Error::new(ErrorKind::InvalidData, "unknown format")),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SystemdUnit {
+    name: String,
+    status: UnitActiveState,
+    freezer: UnitFreezerState,
+}
+impl FromStr for SystemdUnit {
+    type Err = Error;
+
+    fn from_str(unit: &str) -> Result<Self, Error> {
+        let prop = systemd::show_property(unit, "ActiveState")
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let status = UnitActiveState::from_str(&prop)?;
+
+        let prop = systemd::show_property(unit, "FreezerState").unwrap_or("unknown".to_string());
+        let freezer = UnitFreezerState::from_str(&prop)?;
+
+        Ok(Self {
+            name: unit.to_string(),
+            status,
+            freezer,
+        })
+    }
+}
+
+#[derive(Default, Serialize)]
+struct Status {
+    promoter: Vec<PromoterStatus>,
+    prometheus: Vec<PrometheusStatus>,
+    debugger: Vec<DebuggerStatus>,
+    umh: Vec<UMHStatus>,
+    agentx: Vec<AgentXStatus>,
+}
+
+impl Status {
+    fn format(&self, fmt: &Format, verbose: bool) -> Result<String> {
+        match fmt {
+            Format::Terminal => self.terminal(verbose),
+            Format::Json => self.json(),
+        }
+    }
+    fn terminal(&self, verbose: bool) -> Result<String> {
+        let mut w = String::new();
+
+        for p in &self.promoter {
+            write!(w, "{}", p.terminal(verbose)?)?;
+        }
+        for p in &self.prometheus {
+            write!(w, "{}", p.terminal(verbose)?)?;
+        }
+        for p in &self.debugger {
+            write!(w, "{}", p.terminal(verbose)?)?;
+        }
+        for p in &self.umh {
+            write!(w, "{}", p.terminal(verbose)?)?;
+        }
+        for p in &self.agentx {
+            write!(w, "{}", p.terminal(verbose)?)?;
+        }
+
+        Ok(w)
+    }
+    fn json(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+}
+
+#[derive(Serialize)]
+struct PromoterStatus {
+    drbd_resource: String,
+    path: PathBuf,
+    primary_on: PrimaryOn,
+    target: SystemdUnit,
+    dependencies: Vec<SystemdUnit>,
+    status: UnitActiveState,
+}
+
+impl PromoterStatus {
+    fn terminal(&self, verbose: bool) -> Result<String> {
+        let mut w = String::new();
+        writeln!(w, "{}:", self.path.display())?;
+        writeln!(
+            w,
+            "Promoter: Resource {} currently active on {}",
+            self.drbd_resource,
+            self.primary_on.terminal(verbose)?
+        )?;
+
+        writeln!(
+            w,
+            "{} {}",
+            self.target.status.terminal(verbose)?,
+            self.target.name
+        )?;
+
+        for (i, unit) in self.dependencies.iter().enumerate() {
+            let sep = if i == self.dependencies.len() - 1 {
+                "└─"
+            } else {
+                "├─"
+            };
+            write!(
+                w,
+                "{} {} {}",
+                unit.status.terminal(verbose)?,
+                sep,
+                unit.name
+            )?;
+            match unit.freezer {
+                UnitFreezerState::Running | UnitFreezerState::Unknown => writeln!(w)?,
+                _ => writeln!(w, "({})", unit.freezer.terminal(verbose)?)?,
+            };
+        }
+
+        Ok(w)
+    }
+}
+
+#[derive(Serialize)]
+struct PrometheusStatus {
+    path: PathBuf,
+    address: config::LocalAddress,
+    status: UnitActiveState,
+}
+impl PrometheusStatus {
+    fn terminal(&self, verbose: bool) -> Result<String> {
+        let mut w = String::new();
+        writeln!(
+            w,
+            "Prometheus: listening on {}",
+            self.address.to_string().bold().green()
+        )?;
+
+        if verbose {
+            for addr in self.address.to_socket_addrs()? {
+                let status = match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                    Ok(_) => format!("{}", "success".bold().green()),
+                    Err(e) => format!("{} ({})", "failed".bold().red(), e),
+                };
+                writeln!(w, "TCP Connect ({}): {}", addr, status)?;
+            }
+        }
+
+        Ok(w)
+    }
+}
+#[derive(Serialize)]
+struct DebuggerStatus {
+    path: PathBuf,
+    status: UnitActiveState,
+}
+impl DebuggerStatus {
+    fn terminal(&self, _verbose: bool) -> Result<String> {
+        let mut w = String::new();
+        writeln!(w, "Debugger: {}", "started".bold().green())?;
+        Ok(w)
+    }
+}
+
+#[derive(Serialize)]
+struct UMHStatus {
+    path: PathBuf,
+    status: UnitActiveState,
+}
+impl UMHStatus {
+    fn terminal(&self, _verbose: bool) -> Result<String> {
+        let mut w = String::new();
+        writeln!(w, "UMH: {}", "started".bold().green())?;
+        Ok(w)
+    }
+}
+
+#[derive(Serialize)]
+struct AgentXStatus {
+    path: PathBuf,
+    address: String,
+    status: UnitActiveState,
+}
+impl AgentXStatus {
+    fn terminal(&self, _verbose: bool) -> Result<String> {
+        let mut w = String::new();
+        writeln!(
+            w,
+            "AgentX: connecting to main agent at {}",
+            self.address.bold().green()
+        )?;
+        Ok(w)
     }
 }
 
@@ -1592,12 +1737,9 @@ fn info(text: &str) {
 const PROMOTER_TEMPLATE: &str = r###"[[promoter]]
 [promoter.resources.$resname]
 start = ["$service.mount", "$service.service"]
-# runner = "systemd"
-## if unset/empty, services from 'start' will be stopped in reverse order if runner is shell
-## if runner is systemd it just stops the implicitly generated systemd.target
-# stop = []
 # on-drbd-demote-failure = "reboot"
 # stop-services-on-exit = false
+# on-disk-detach = "ignore"
 #
 # for more complex setups like HA iSCSI targets, NFS exports, or NVMe-oF targets consider
 # https://github.com/LINBIT/linstor-gateway which uses LINSTOR and drbd-reactor"###;

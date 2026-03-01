@@ -1,1 +1,5 @@
 /target
+/sbom
+/untracked
+/.claude
+drbd-reactor-*.tar.gz
